@@ -4,4 +4,4 @@ Spartment is an apartment management system that manages building and room infor
 
 ## Documentation
 
-- [ETL Stage 1: Data Extraction](docs/extraction.md)
+- [ETL Stage 1: Data Extraction](Docs/extraction.md)
