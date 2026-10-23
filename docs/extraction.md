@@ -10,7 +10,7 @@ The extracted data supports room availability and occupancy monitoring, tenant a
 
 > Extraction performs retrieval and extraction level validation only. Data cleaning, standardization, analytical joins and business calculations belong to the transformation stage.
 
-This document describes the pipeline as implemented in `src/spartment/` and `dags/`. Every column list and data type below was verified against the live PostgREST schema, not inferred.
+This document describes the pipeline as implemented in `src/spartment/` and `dags/`. Every column list and data type below was verified against the live PostgREST schema, not inferred. The downstream stage is specified in [transformation.md](transformation.md).
 
 ---
 
@@ -282,6 +282,93 @@ The gate task fails the run when the decision is `REJECTED`, and logs a warning 
 - `migrations/` does not fully describe the deployed database. It creates only `tenant_assignments`, `tenant_requests`, `tenant_occupancy_events`, `payment_corrections`, `password_recovery_sessions`, `password_recovery_limits` and `login_attempt_limits`. Eight of the twelve extracted tables are assumed to pre-exist, and `inquiries.room_id` exists in the database without appearing in any migration.
 - The live schema is the source of truth. The schema guard reconciles the contract against the PostgREST schema root on every run and quarantines any non conforming table.
 
+### 2.3 Contract Summary
+
+The machine readable source of truth is `src/spartment/stage1_extract/contract.py`; this section is its human readable companion.
+
+| Table | Columns | Required identifiers | Purpose |
+| --- | --- | --- | --- |
+| `profiles` | 5 | `id`, `role` | Tenant and staff identity |
+| `buildings` | 4 | `id`, `name` | Building identification |
+| `rooms` | 11 | `id`, `status` | Availability, capacity, rates |
+| `leases` | 6 | `id`, `tenant_id`, `move_in_date` | Tenancy spine |
+| `tenant_assignments` | 13 | `id`, `full_name`, `email`, `phone`, `monthly_rent`, `move_in`, `status` | Tenant to room assignment |
+| `bills` | 10 | `id`, `billing_period`, `due_date` | Billing obligations |
+| `payments` | 6 | `id`, `bill_id`, `amount`, `payment_date` | Cash receipts |
+| `payment_corrections` | 7 | `id`, `payment_id`, `reason`, `created_at` | Payment audit trail |
+| `inquiries` | 10 | `id`, `email`, `status` | Prospective tenants |
+| `tenant_requests` | 11 | `id`, `tenant_id`, `kind`, `subject`, `priority`, `status` | Tenant requests |
+| `tenant_occupancy_events` | 7 | `id`, `tenant_id`, `previous_lease_id`, `performed_by`, `created_at` | Occupancy transitions |
+| `notifications` | 8 | `id`, `tenant_id`, `title`, `created_at` | Event audit trail |
+
+#### Relationships
+
+17 edges. Null values are permitted and are not treated as orphans.
+
+| Child | Column | Parent |
+| --- | --- | --- |
+| `rooms` | `building_id` | `buildings.id` |
+| `leases` | `tenant_id` | `profiles.id` |
+| `leases` | `room_id` | `rooms.id` |
+| `tenant_assignments` | `room_id` | `rooms.id` |
+| `tenant_assignments` | `id` | `auth.users.id` — unverifiable |
+| `bills` | `lease_id` | `leases.id` |
+| `payments` | `bill_id` | `bills.id` |
+| `payment_corrections` | `payment_id` | `payments.id` |
+| `payment_corrections` | `corrected_by` | `auth.users.id` — unverifiable |
+| `inquiries` | `room_id` | `rooms.id` |
+| `tenant_requests` | `tenant_id` | `profiles.id` |
+| `tenant_requests` | `room_id` | `rooms.id` |
+| `tenant_occupancy_events` | `tenant_id` | `profiles.id` |
+| `tenant_occupancy_events` | `previous_lease_id` | `leases.id` |
+| `tenant_occupancy_events` | `new_lease_id` | `leases.id` |
+| `tenant_occupancy_events` | `performed_by` | `profiles.id` |
+| `notifications` | `tenant_id` | `profiles.id` |
+
+`auth.users` is outside extraction scope, so those two edges are reported as `target_table_unavailable` and excluded from the acceptance decision.
+
+#### Legitimate nulls
+
+These nulls are correct and must not be flagged:
+
+| Column | When null |
+| --- | --- |
+| `tenant_assignments.room_id` | assignment status is `ended` |
+| `tenant_assignments.lease_end` | open ended tenancy |
+| `tenant_requests.room_id` | request kind is `other` |
+| `tenant_occupancy_events.new_lease_id` | move out |
+| `inquiries.phone` | not supplied |
+
+`inquiries.room_id` and `leases.lease_end_date` are permitted but not expected to be null.
+
+#### Optional and extra columns
+
+`inquiries.room_id` is optional: it is present in the deployed database, absent from every file in `migrations/`, and selected only when the live schema exposes it.
+
+Columns the original contract omitted are selected by default. Disable them with `--no-extra-columns`.
+
+| Table | Columns |
+| --- | --- |
+| `rooms` | `description` |
+| `tenant_assignments` | `emergency_name`, `emergency_phone`, `relationship` |
+| `inquiries` | `message` |
+| `tenant_requests` | `message`, `admin_note` |
+| `tenant_occupancy_events` | `details` |
+
+`tenant_occupancy_events.details` is `NOT NULL` and holds the actual move date, room, rent and end date. Without it that table has no payload.
+
+#### Mapping and domain rules
+
+All 98 columns map `Direct`. Source names, values and types are preserved. No renaming, no type coercion, no trimming, no unit conversion. Column types are recorded in every run manifest because CSV stores values as text.
+
+| Rule | Scope |
+| --- | --- |
+| Observed enum domains | `profiles.role`, `rooms.status`, `leases.status`, `bills.status` |
+| Monetary, must not be negative | `rooms.monthly_rate`, `tenant_assignments.monthly_rent`, `bills.rent_amount`/`electricity_amount`/`water_amount`, `payments.amount` |
+| Numeric bounds | `rooms.size_sqm` between 8 and 14 |
+| Date ordering | `tenant_assignments.lease_end >= move_in`, `leases.lease_end_date >= move_in_date` |
+| Invariant | `tenant_assignments`: `active` requires a `room_id`, `ended` requires none |
+
 ---
 
 ## 3. Extraction Validation and Data Quality Checks
@@ -520,4 +607,98 @@ python -m spartment.common.retention
 
 ### Credentials
 
-`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are read from a `.env` file at the repository root, which is excluded from version control. In Airflow the same values are supplied by the `spartment_postgres` connection. A database superuser password is never required and must never be placed in this repository.
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are read from a `.env` file at the repository root, which is excluded from version control. In Airflow the same values are supplied by the `spartment_postgres` connection. A database superuser password is never required and must never be placed in this repository. See `.env.example`.
+
+The anon key is not used. If the service role key is ever committed or pasted into a channel, rotate it in Supabase under Project Settings, then API.
+
+---
+
+## 10. Operations Runbook
+
+Day to day operation of the extraction stage.
+
+### 10.1 Daily run
+
+The Airflow DAG `spartment_daily_extraction` runs at 01:00 Asia/Manila with up to 3 retries. Nothing is required manually on a normal day.
+
+To run it by hand:
+
+```bash
+spartment-extract
+```
+
+### 10.2 Reading the result
+
+```
+acceptance    APPROVED          promote to transformation
+acceptance    MANUAL REVIEW     promotion held, exit 5
+acceptance    REJECTED          promotion blocked, exit 4
+```
+
+The handover record is the entry point for every investigation:
+
+```
+rawdata/_handover/<run_id>.json
+```
+
+It contains the acceptance decision and its rationale, the responsible party, per table validation summary, staged dataset paths, extraction metadata, all validation checks with evidence, rejected and quarantined references, the standardized column mapping, the column type manifest, and the processing period.
+
+The exit codes are listed in section 7.4.
+
+### 10.3 Rejection
+
+A `REJECTED` run has a critical failure. Do not promote.
+
+| Cause | Where to look | Recovery |
+| --- | --- | --- |
+| Connectivity lost | `source_connection_accessibility` evidence | Confirm the endpoint and credentials, re-run |
+| Schema drift | `required_tables_and_columns_exist` evidence | Compare the live schema with `contract.py`, confirm the change, update the contract, re-extract |
+| Duplicate primary keys | `primary_key_uniqueness` evidence | Indicates a pagination defect or concurrent source writes. Re-extract; if it repeats, stop and investigate |
+| Incomplete extraction | `record_count_completeness` or `extraction_errors_or_interruptions` | Re-run the affected tables |
+| Null required identifier | `required_identifiers_present` evidence | Flagged rows are listed with their CSV line number. Do not invent identifiers |
+
+Escalate to the Database Owner when the defect is on the source side.
+
+### 10.4 Manual review
+
+Non critical warnings hold promotion without failing the run. Common causes are negative monetary values, inverted dates, unresolved relationship references, room sizes outside the permitted range, and assignment status inconsistent with the room reference.
+
+Review the evidence in the handover record, then either correct the source data and re-run, or record a decision to promote with the warning accepted.
+
+### 10.5 Recovery and re-extraction
+
+```bash
+spartment-extract --tables rooms
+```
+
+Every run is independent and full. To rebuild, re-run the affected tables. Raw datasets are reproducible from the source, so no backup of `rawdata/` is required.
+
+Both the failed run and the recovery run remain traceable by run id. Run ids are `spartment-extract-<date>-<HHMM>` with a counter suffix when a minute is reused, so nothing is overwritten.
+
+Retention and its commands are described in section 5.
+
+### 10.6 Airflow
+
+The DAG needs the package installed in the Airflow environment:
+
+```bash
+pip install -e .
+```
+
+Airflow places only its own `dags_folder` on `sys.path`, so a repository relative import would not resolve. The DAG reads credentials from the Airflow connection `spartment_postgres`.
+
+Point the scheduler at the repository:
+
+```bash
+airflow dags list          # with --dags-folder configured
+```
+
+`max_active_runs=1`, so overlapping runs cannot occur. The gate task fails the run on `REJECTED` and logs a warning on `MANUAL REVIEW`.
+
+### 10.7 Known limitations
+
+- `auth.users` is not reachable, so `tenant_assignments.id` and `payment_corrections.corrected_by` cannot be referentially validated.
+- Enum members are not exposed by PostgREST, so domains are reported as observed rather than asserted.
+- Pages are ordered by the immutable `id`, so nothing is skipped or duplicated, but a run is not a single consistent database instant.
+- `rooms.updated_at` is populated in practice but has no trigger in `migrations/`, so it is not trusted as a watermark.
+- The DAG has not been executed in this environment; it is syntax checked only.

@@ -2,13 +2,12 @@
 
 Operational and analytical batch data pipeline for the Spartment apartment management system.
 
-Stage 1 extracts the operational tables from Supabase into `rawdata/`, validates them, and records an acceptance decision. Stage 2 (transformation) and Stage 3 (load) are reserved.
+Stage 1 extracts the operational tables from Supabase into `rawdata/`, validates them, and records an acceptance decision. Stage 2 (transformation) is specified but not implemented; Stage 3 (load) is reserved.
 
 ## Documentation
 
-- [Stage 1: Data Extraction](docs/extraction.md) — full specification
-- [Data contract](docs/data_contract.md) — the 12 extracted tables and their columns
-- [Runbook](docs/runbook.md) — operations, recovery and retention
+- [Stage 1: Data Extraction](docs/extraction.md) — extraction specification, data contract, and operations runbook
+- [Stage 2: Data Transformation](docs/transformation.md) — transformation specification and output contract
 
 ## Layout
 
@@ -21,7 +20,7 @@ src/spartment/
   stage2_transform/           reserved
   stage3_load/                reserved
 migrations/                   SQL migrations for the source database
-docs/                         specifications and runbooks
+docs/                         stage specifications
 rawdata/                      staged output, not version controlled
 ```
 
